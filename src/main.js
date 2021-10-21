@@ -522,7 +522,7 @@ Apify.main(async () => {
 
             if (label === LABELS.INITIAL || !queryZpid) {
                 try {
-                    log.info('Trying to get queryId...');
+                    log.info('Trying to get queryId ...');
 
                     const { queryId, clientVersion } = await interceptQueryId(page, proxyInfo);
 
