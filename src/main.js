@@ -33,8 +33,8 @@ Apify.main(async () => {
     const isDebug = input.debugLog === true;
 
     // Check input
-    if (!(input.search && input.search.trim().length > 0) && !input.startUrls && !input.zpids) {
-        throw new Error('Either "search", "startUrls" or "zpids" attribute has to be set!');
+    if (!(input.search && input.search.trim().length > 0) && !input.startUrls && !input.zpids && !input.propertyUrls) {
+        throw new Error('Either "search", "startUrls", "propertyUrls" or "zpids" attribute has to be set!');
     }
 
     const proxyConfig = await proxyConfiguration({
@@ -641,20 +641,26 @@ Apify.main(async () => {
                     }
                 }
             } else {
-                log.info(`Extracting data from ${page.url()}`);
 
-                const splitUrl = page.url().split("_rb/")[1]
+                try {
+                    log.info(`Extracting data from ${page.url()}`);
 
-                if (splitUrl) {
-                    const zpid = splitUrl.split("_z")[0];
+                    const splitUrl = page.url().split("_rb/")[1]
 
-                    if (zpid) {
-                        await processZpid(zpid, '');
+                    if (splitUrl) {
+                        const zpid = splitUrl.split("_z")[0];
+
+                        if (zpid) {
+                            await processZpid(zpid, '');
+                        } else {
+                            log.info(`No zpid found from ${page.url()}`);
+                        }
                     } else {
                         log.info(`No zpid found from ${page.url()}`);
                     }
-                } else {
-                    log.info(`No zpid found from ${page.url()}`);
+                } catch (e) {
+                    log.info(e.message);
+                    log.info(`Extracting data from ${page.url()} failed`);
                 }
             }
             // } else if (label === LABELS.QUERY || label === LABELS.SEARCH) {
