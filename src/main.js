@@ -640,6 +640,8 @@ Apify.main(async () => {
                         break;
                     }
                 }
+            } else {
+                log.info('Got into else...');
             }
 
             await extendScraperFunction(undefined, {
