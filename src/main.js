@@ -186,9 +186,11 @@ Apify.main(async () => {
                 throw new Error(`Invalid startUrl ${req.url}`);
             }
 
+            let urlData = getUrlData(req.url)
+            urlData.eid =  req.id
             startUrls.push({
                 url: req.url,
-                userData: getUrlData(req.url),
+                userData: urlData,
             });
         }
     }
