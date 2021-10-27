@@ -507,6 +507,8 @@ Apify.main(async () => {
                         return;
                     }
 
+                    log.info('Retrying processZpid w/ zzeid: ', zzeid)
+
                     // add as a separate detail for retrying
                     await requestQueue.addRequest({
                         url: new URL(detailUrl || `/homedetails/${zpid}_zpid/`, 'https://www.zillow.com').toString(),
@@ -644,9 +646,6 @@ Apify.main(async () => {
                     }
                 }
             } else {
-                log.info(`Request details:`);
-                log.info(`${request}`)
-
                 try {
                     log.info(`Extracting data from ${page.url()}`);
 
@@ -656,7 +655,7 @@ Apify.main(async () => {
                         const zpid = splitUrl.split("_z")[0];
 
                         if (zpid) {
-                            await processZpid(zpid, '', request.userData.eid);
+                            await processZpid(zpid, '', request.userData.zzeid);
                         } else {
                             log.info(`No zpid found from ${page.url()}`);
                         }
