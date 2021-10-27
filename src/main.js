@@ -187,7 +187,7 @@ Apify.main(async () => {
             }
 
             let urlData = getUrlData(req.url)
-            urlData.eid =  req.id
+            urlData.zzeid =  req.id
             startUrls.push({
                 url: req.url,
                 userData: urlData,
@@ -466,7 +466,7 @@ Apify.main(async () => {
              * @param {string} zpid
              * @param {string} detailUrl
              */
-            const processZpid = async (zpid, detailUrl) => {
+            const processZpid = async (zpid, detailUrl, zzeid) => {
                 if (isOverItems()) {
                     return;
                 }
@@ -513,6 +513,7 @@ Apify.main(async () => {
                         userData: {
                             label: LABELS.DETAIL,
                             zpid: +zpid,
+                            zzeid: zzeid
                         },
                     }, { forefront: true });
                 } finally {
@@ -636,13 +637,15 @@ Apify.main(async () => {
                 log.info(`Scraping ${input.zpids.length} zpids`);
 
                 for (const zpid of input.zpids) {
-                    await processZpid(zpid, '');
+                    await processZpid(zpid, '', '');
 
                     if (isOverItems()) {
                         break;
                     }
                 }
             } else {
+                log.info(`Request details:`);
+                log.info(`${request}`)
 
                 try {
                     log.info(`Extracting data from ${page.url()}`);
@@ -653,7 +656,7 @@ Apify.main(async () => {
                         const zpid = splitUrl.split("_z")[0];
 
                         if (zpid) {
-                            await processZpid(zpid, '');
+                            await processZpid(zpid, '', request.userData.eid);
                         } else {
                             log.info(`No zpid found from ${page.url()}`);
                         }
