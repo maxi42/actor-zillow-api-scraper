@@ -657,10 +657,39 @@ Apify.main(async () => {
                         if (zpid) {
                             await processZpid(zpid, '', request.userData.zzeid);
                         } else {
-                            log.info(`No zpid found from ${page.url()}`);
+                            // let totalAmount = await page.$$('.unit-card-grid.unit-card')).length
+                            let totalAmount = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card").length )
+                            if(totalAmount > 0) {
+                                // let result2 = await page.waitForSelector('.unit-card-grid.unit-card')
+                                let zpid = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card")[0].getAttribute("data-test-id") )
+                                if(zpid){
+                                    log.info(`zpid from ${zpid}`);
+                                    await processZpid(zpid, '', request.userData.zzeid);
+                                }else{
+                                    log.info(`zpid not found  from unit-card-grid unit-card`);
+                                }
+                            }else{
+                                log.info(`several zpid found from unit-card-grid unit-card ${totalAmount}`);
+                            }
+
                         }
                     } else {
-                        log.info(`No zpid found from ${page.url()}`);
+                        // let totalAmount = await page.$$('.unit-card-grid.unit-card')).length
+
+                        let totalAmount = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card").length )
+                        if(totalAmount > 0) {
+                            // let result2 = await page.waitForSelector('.unit-card-grid.unit-card')
+                            let zpid = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card")[0].getAttribute("data-test-id") )
+                            if(zpid){
+                                log.info(`zpid from ${zpid}`);
+                                await processZpid(zpid, '', request.userData.zzeid);
+                            }else{
+                                log.info(`zpid not found  from unit-card-grid unit-card`);
+                            }
+                        }else{
+                            log.info(`several zpid found from unit-card-grid unit-card ${totalAmount}`);
+                        }
+                        // log.info(`No zpid found from ${page.url()}`);
                     }
                 } catch (e) {
                     log.info(e.message);
