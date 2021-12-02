@@ -3,6 +3,8 @@ const HeaderGenerator = require('header-generator');
 const _ = require('lodash');
 const { LABELS, TYPES, INITIAL_URL } = require('./constants');
 const fns = require('./functions');
+const got = require('got');
+const {parseCSV} = require('csv-load-sync');
 
 const {
     createGetSimpleResult,
@@ -178,6 +180,33 @@ Apify.main(async () => {
     }
 
     if (input.startUrls && input.startUrls.length) {
+        // console.log(input.startUrls);
+
+        const parsingUrl = input.startUrls[0].requestsFromUrl;
+        let records;
+        if (parsingUrl){
+            const { body: csv } = await got(parsingUrl);
+            records = parseCSV(csv);
+
+            let address = "";
+            let url = "";
+            input.startUrls = []
+
+            records.forEach(function (row, index) {
+                address = [row['STREET_NUMBER'] + row['STREET_NAME'], row['CITY'], row['STATE'],row['ZIP_CODE']].join(',')
+                url = "https://www.zillow.com/homes/" + address.replace(' ', '-') + '_rb/'
+                input.startUrls.push({
+                    url: url,
+                    id: row['ID'],
+                    userData: {
+                        eid: row['ID']
+                    }
+                });
+            });
+        }
+
+        // console.log(input.startUrls);
+
         const requestList = await Apify.openRequestList('STARTURLS', input.startUrls);
 
         let req;
@@ -186,8 +215,8 @@ Apify.main(async () => {
                 throw new Error(`Invalid startUrl ${req.url}`);
             }
 
-            let urlData = getUrlData(req.url)
-            urlData.zzeid =  req.id
+            const urlData = getUrlData(req.url);
+            urlData.eid = req.id;
             startUrls.push({
                 url: req.url,
                 userData: urlData,
@@ -262,6 +291,8 @@ Apify.main(async () => {
             }
         },
         output: async (output, { data }) => {
+            // console.log('output:', output)
+            // console.log('data:', data)
             if (data.zpid && !isOverItems()) {
                 zpids.add(`${data.zpid}`);
                 await Apify.pushData(output);
@@ -466,7 +497,7 @@ Apify.main(async () => {
              * @param {string} zpid
              * @param {string} detailUrl
              */
-            const processZpid = async (zpid, detailUrl, zzeid) => {
+            const processZpid = async (zpid, detailUrl, eid) => {
                 if (isOverItems()) {
                     return;
                 }
@@ -496,6 +527,7 @@ Apify.main(async () => {
                             request,
                             page,
                             zpid,
+                            eid,
                         },
                     );
                 } catch (e) {
@@ -507,15 +539,13 @@ Apify.main(async () => {
                         return;
                     }
 
-                    log.info('Retrying processZpid w/ zzeid: ', zzeid)
-
                     // add as a separate detail for retrying
                     await requestQueue.addRequest({
                         url: new URL(detailUrl || `/homedetails/${zpid}_zpid/`, 'https://www.zillow.com').toString(),
                         userData: {
                             label: LABELS.DETAIL,
                             zpid: +zpid,
-                            zzeid: zzeid
+                            eid: eid
                         },
                     }, { forefront: true });
                 } finally {
@@ -603,7 +633,7 @@ Apify.main(async () => {
                     throw new Error('Failed to load preloaded data scripts');
                 }
 
-                log.info(`Extracting data from ${request.url}`);
+                log.info(`LABELS.DETAIL Extracting data from ${request.url}`);
                 let noScriptsFound = true;
 
                 for (const script of scripts) {
@@ -616,6 +646,7 @@ Apify.main(async () => {
                                     request,
                                     page,
                                     zpid: request.userData.zpid,
+                                    eid: request.userData.eid,
                                 });
 
                                 noScriptsFound = false;
@@ -645,287 +676,279 @@ Apify.main(async () => {
                         break;
                     }
                 }
-            } else {
+            } else if ((label === LABELS.QUERY || label === LABELS.SEARCH) && request.userData.term) {
+                if (label === LABELS.SEARCH) {
+                    log.info(`Searching for "${request.userData.term}"`);
+
+                    const text = '#search-box-input';
+                    const btn = 'button#search-icon';
+
+                    await page.waitForRequest((req) => req.url().includes('/login'));
+
+                    await Promise.all([
+                        page.waitForSelector(text),
+                        page.waitForSelector(btn),
+                    ]);
+
+                    await page.focus(text);
+                    await Promise.all([
+                        page.waitForResponse((res) => res.url().includes('suggestions')),
+                        page.type(text, request.userData.term, { delay: 150 }),
+                    ]);
+
+                    try {
+                        await Promise.all([
+                            page.waitForNavigation({ timeout: 10000 }),
+                            page.tap(btn),
+                        ]);
+                    } catch (e) {
+                        log.debug(e.message);
+
+                        const interstitial = await page.$$('#interstitial-title');
+                        if (!interstitial.length) {
+                            session.retire();
+                            throw new Error('Search didn\'t redirect, retrying...');
+                        } else {
+                            const skip = await page.$x('//button[contains(., "Skip")]');
+
+                            try {
+                                await Promise.all([
+                                    page.waitForNavigation({ timeout: 25000 }),
+                                    skip[0].click(),
+                                ]);
+                            } catch (e) {
+                                log.debug(`Insterstitial`, { message: e.message });
+                                throw new Error('Search page didn\'t redirect in time');
+                            }
+                        }
+                    }
+
+                    if ((!/(\/homes\/|_rb)/.test(page.url()) || page.url().includes('/_rb/') || page.url().includes('_zpid')) && !page.url().includes('searchQueryState')) {
+                        session.retire();
+                        throw new Error(`Unexpected page address ${page.url()}, use a better keyword for searching or proper state or city name. Will retry...`);
+                    }
+
+                    if (await page.$('.captcha-container')) {
+                        session.retire();
+                        throw new Error('Captcha found when searching, retrying...');
+                    }
+                }
+
+                // Get initial searchState
+                const queryStates = [];
+                let totalCount = 0;
+                let shouldContinue = true;
+
                 try {
-                    log.info(`Extracting data from ${page.url()}`);
+                    const pageQs = await page.evaluate(() => {
+                        try {
+                            return JSON.parse(
+                                document.querySelector(
+                                    'script[data-zrr-shared-data-key="mobileSearchPageStore"]',
+                                ).innerHTML.slice(4, -3),
+                            );
+                        } catch (e) {
+                            return {};
+                        }
+                    });
 
-                    const splitUrl = page.url().split("_rb/")[1]
+                    const results = [
+                        ..._.get(pageQs, 'cat1.searchResults.listResults', []),
+                        ..._.get(pageQs, 'cat1.searchResults.mapResults', []),
+                        ..._.get(pageQs, 'cat2.searchResults.listResults', []),
+                        ..._.get(pageQs, 'cat2.searchResults.mapResults', []),
+                    ];
 
-                    if (splitUrl) {
-                        const zpid = splitUrl.split("_z")[0];
+                    for (const { zpid, detailUrl } of results) {
+                        await dump(zpid, results);
 
                         if (zpid) {
-                            await processZpid(zpid, '', request.userData.zzeid);
-                        } else {
-                            // let totalAmount = await page.$$('.unit-card-grid.unit-card')).length
-                            let totalAmount = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card").length )
-                            if(totalAmount > 0) {
-                                // let result2 = await page.waitForSelector('.unit-card-grid.unit-card')
-                                let zpid = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card")[0].getAttribute("data-test-id") )
-                                if(zpid){
-                                    log.info(`zpid from ${zpid}`);
-                                    await processZpid(zpid, '', request.userData.zzeid);
-                                }else{
-                                    log.info(`zpid not found  from unit-card-grid unit-card`);
-                                }
-                            }else{
-                                log.info(`several zpid found from unit-card-grid unit-card ${totalAmount}`);
+                            if (isOverItems()) {
+                                shouldContinue = false;
+                                break;
                             }
-
+                            await processZpid(zpid, detailUrl);
                         }
-                    } else {
-                        // let totalAmount = await page.$$('.unit-card-grid.unit-card')).length
+                    }
 
-                        let totalAmount = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card").length )
-                        if(totalAmount > 0) {
-                            // let result2 = await page.waitForSelector('.unit-card-grid.unit-card')
-                            let zpid = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card")[0].getAttribute("data-test-id") )
-                            if(zpid){
-                                log.info(`zpid from ${zpid}`);
-                                await processZpid(zpid, '', request.userData.zzeid);
-                            }else{
-                                log.info(`zpid not found  from unit-card-grid unit-card`);
-                            }
-                        }else{
-                            log.info(`several zpid found from unit-card-grid unit-card ${totalAmount}`);
+                    if (shouldContinue) {
+                        for (const cat of ['cat1', 'cat2']) {
+                            const result = await page.evaluate(
+                                queryRegionHomes,
+                                {
+                                    qs: translateQsToFilter(request.userData.searchQueryState || pageQs.queryState),
+                                    // use a special type so the query state that comes from the url
+                                    // doesn't get erased
+                                    type: request.userData.searchQueryState ? 'qs' : input.type,
+                                    cat,
+                                },
+                            );
+
+                            log.debug('query', result.qs);
+
+                            const searchState = JSON.parse(result.body);
+
+                            queryStates.push({
+                                qs: result.qs,
+                                searchState,
+                            });
+
+                            totalCount += searchState?.categoryTotals?.[cat]?.totalResultCount ?? 0;
                         }
-                        // log.info(`No zpid found from ${page.url()}`);
                     }
                 } catch (e) {
-                    log.info(e.message);
-                    log.info(`Extracting data from ${page.url()} failed`);
+                    log.debug(e);
+                }
+
+                log.debug('searchState', { queryStates });
+
+                if (shouldContinue && queryStates?.length) {
+                    // Check mapResults
+                    const results = queryStates.flatMap(({ searchState }) => [
+                        ..._.get(
+                            searchState,
+                            'cat1.searchResults.mapResults',
+                            [],
+                        ),
+                        ..._.get(
+                            searchState,
+                            'cat1.searchResults.listResults',
+                            [],
+                        ),
+                        ..._.get(
+                            searchState,
+                            'cat2.searchResults.mapResults',
+                            [],
+                        ),
+                        ..._.get(
+                            searchState,
+                            'cat2.searchResults.listResults',
+                            [],
+                        ),
+                    ]);
+
+                    if (!results?.length) {
+                        session.retire();
+                        if (totalCount > 0) {
+                            await Apify.setValue(`SEARCHSTATE-${Math.random()}`, queryStates);
+                            throw new Error(`No map results but result count is ${totalCount}`);
+                        } else {
+                            log.debug('Really zero results');
+                            return;
+                        }
+                    }
+
+                    for (const { qs } of queryStates) {
+                        log.info(`Searching homes at ${JSON.stringify(qs.mapBounds)}`, {
+                            url: page.url(),
+                        });
+
+                        // Extract home data from mapResults
+                        const thr = input.splitThreshold || 500;
+
+                        if (results.length >= thr) {
+                            if (input.maxLevel && (request.userData.splitCount || 0) >= input.maxLevel) {
+                                log.info('Over max level');
+                            } else {
+                                // Split map and enqueue sub-rectangles
+                                const splitCount = (request.userData.splitCount || 0) + 1;
+                                const split = splitQueryState(qs);
+
+                                for (const searchQueryState of split) {
+                                    if (isOverItems()) {
+                                        break;
+                                    }
+
+                                    const uniqueKey = quickHash(`${request.url}${splitCount}${JSON.stringify(searchQueryState)}`);
+                                    log.debug('queryState', { searchQueryState, uniqueKey });
+                                    const url = new URL(request.url);
+
+                                    url.searchParams.set('searchQueryState', JSON.stringify(searchQueryState));
+
+                                    await requestQueue.addRequest({
+                                        url: url.toString(),
+                                        userData: {
+                                            searchQueryState,
+                                            label: LABELS.QUERY,
+                                            splitCount,
+                                        },
+                                        uniqueKey,
+                                    });
+                                }
+                            }
+                        }
+
+                        if (results.length > 0) {
+                            const extracted = () => {
+                                log.info(`Extracted total ${zpids.size}`);
+                            };
+                            const interval = setInterval(extracted, 10000);
+
+                            try {
+                                for (const { zpid, detailUrl } of results) {
+                                    await dump(zpid, results);
+
+                                    if (zpid) {
+                                        await processZpid(zpid, detailUrl);
+
+                                        if (isOverItems()) {
+                                            break; // optimize runtime
+                                        }
+                                    }
+                                }
+                            } finally {
+                                if (!anyErrors) {
+                                    extracted();
+                                }
+                                clearInterval(interval);
+                            }
+                        }
+                    }
+                }
+            } else {
+                log.info(`LABELS Extracting data from ${page.url()}`);
+
+                await page.waitForFunction('document.location.href.includes("zpid")', { timeout: 20000 });
+
+                const splitUrl = page.url().split('_rb/')[1];
+
+                if (splitUrl) {
+                    const zpid = splitUrl.split('_z')[0];
+
+                    if (zpid) {
+                        log.info(`zpid from ${zpid}`);
+                        await processZpid(zpid, '', request.userData.eid);
+                    } else {
+                        const totalAmount = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card").length )
+                        if (totalAmount > 0) {
+                            const zpidQuery = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card")[0].getAttribute("data-test-id") )
+                            if (zpidQuery) {
+                                log.info(`zpid from ${zpidQuery}`);
+                                await processZpid(zpidQuery, '', request.userData.eid);
+                            } else {
+                                throw new Error('zpid could not be retrieved');
+                            }
+                        } else {
+                            throw new Error('zpid could not be retrieved');
+                        }
+                    }
+                } else {
+                    let zpid;
+
+                    const totalAmount = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card").length )
+                    if (totalAmount > 0) {
+                        zpid = await page.evaluate(() => document.querySelectorAll(".unit-card-grid.unit-card")[0].getAttribute("data-test-id") )
+                        if (zpid) {
+                            log.info(`zpid from ${zpid}`);
+                            await processZpid(zpid, '', request.userData.eid);
+                        } else {
+                            throw new Error('zpid could not be retrieved');
+                        }
+                    } else {
+                        throw new Error('zpid could not be retrieved');
+                    }
                 }
             }
-            // } else if (label === LABELS.QUERY || label === LABELS.SEARCH) {
-            //     if (label === LABELS.SEARCH) {
-            //         log.info(`Searching for "${request.userData.term}"`);
-
-            //         const text = '#search-box-input';
-            //         const btn = 'button#search-icon';
-
-            //         await page.waitForRequest((req) => req.url().includes('/login'));
-
-            //         await Promise.all([
-            //             page.waitForSelector(text),
-            //             page.waitForSelector(btn),
-            //         ]);
-
-            //         await page.focus(text);
-            //         await Promise.all([
-            //             page.waitForResponse((res) => res.url().includes('suggestions')),
-            //             page.type(text, request.userData.term, { delay: 150 }),
-            //         ]);
-
-            //         try {
-            //             await Promise.all([
-            //                 page.waitForNavigation({ timeout: 10000 }),
-            //                 page.tap(btn),
-            //             ]);
-            //         } catch (e) {
-            //             log.debug(e.message);
-
-            //             const interstitial = await page.$$('#interstitial-title');
-            //             if (!interstitial.length) {
-            //                 session.retire();
-            //                 throw new Error('Search didn\'t redirect, retrying...');
-            //             } else {
-            //                 const skip = await page.$x('//button[contains(., "Skip")]');
-
-            //                 try {
-            //                     await Promise.all([
-            //                         page.waitForNavigation({ timeout: 25000 }),
-            //                         skip[0].click(),
-            //                     ]);
-            //                 } catch (e) {
-            //                     log.debug(`Insterstitial`, { message: e.message });
-            //                     throw new Error('Search page didn\'t redirect in time');
-            //                 }
-            //             }
-            //         }
-
-            //         if ((!/(\/homes\/|_rb)/.test(page.url()) || page.url().includes('/_rb/') || page.url().includes('_zpid')) && !page.url().includes('searchQueryState')) {
-            //             session.retire();
-            //             throw new Error(`Unexpected page address ${page.url()}, use a better keyword for searching or proper state or city name. Will retry...`);
-            //         }
-
-            //         if (await page.$('.captcha-container')) {
-            //             session.retire();
-            //             throw new Error('Captcha found when searching, retrying...');
-            //         }
-            //     }
-
-            //     // Get initial searchState
-            //     const queryStates = [];
-            //     let totalCount = 0;
-            //     let shouldContinue = true;
-
-            //     try {
-            //         const pageQs = await page.evaluate(() => {
-            //             try {
-            //                 return JSON.parse(
-            //                     document.querySelector(
-            //                         'script[data-zrr-shared-data-key="mobileSearchPageStore"]',
-            //                     ).innerHTML.slice(4, -3),
-            //                 );
-            //             } catch (e) {
-            //                 return {};
-            //             }
-            //         });
-
-            //         const results = [
-            //             ..._.get(pageQs, 'cat1.searchResults.listResults', []),
-            //             ..._.get(pageQs, 'cat1.searchResults.mapResults', []),
-            //             ..._.get(pageQs, 'cat2.searchResults.listResults', []),
-            //             ..._.get(pageQs, 'cat2.searchResults.mapResults', []),
-            //         ];
-
-            //         for (const { zpid, detailUrl } of results) {
-            //             await dump(zpid, results);
-
-            //             if (zpid) {
-            //                 if (isOverItems()) {
-            //                     shouldContinue = false;
-            //                     break;
-            //                 }
-            //                 await processZpid(zpid, detailUrl);
-            //             }
-            //         }
-
-            //         if (shouldContinue) {
-            //             for (const cat of ['cat1', 'cat2']) {
-            //                 const result = await page.evaluate(
-            //                     queryRegionHomes,
-            //                     {
-            //                         qs: translateQsToFilter(request.userData.searchQueryState || pageQs.queryState),
-            //                         // use a special type so the query state that comes from the url
-            //                         // doesn't get erased
-            //                         type: request.userData.searchQueryState ? 'qs' : input.type,
-            //                         cat,
-            //                     },
-            //                 );
-
-            //                 log.debug('query', result.qs);
-
-            //                 const searchState = JSON.parse(result.body);
-
-            //                 queryStates.push({
-            //                     qs: result.qs,
-            //                     searchState,
-            //                 });
-
-            //                 totalCount += searchState?.categoryTotals?.[cat]?.totalResultCount ?? 0;
-            //             }
-            //         }
-            //     } catch (e) {
-            //         log.debug(e);
-            //     }
-
-            //     log.debug('searchState', { queryStates });
-
-            //     if (shouldContinue && queryStates?.length) {
-            //         // Check mapResults
-            //         const results = queryStates.flatMap(({ searchState }) => [
-            //             ..._.get(
-            //                 searchState,
-            //                 'cat1.searchResults.mapResults',
-            //                 [],
-            //             ),
-            //             ..._.get(
-            //                 searchState,
-            //                 'cat1.searchResults.listResults',
-            //                 [],
-            //             ),
-            //             ..._.get(
-            //                 searchState,
-            //                 'cat2.searchResults.mapResults',
-            //                 [],
-            //             ),
-            //             ..._.get(
-            //                 searchState,
-            //                 'cat2.searchResults.listResults',
-            //                 [],
-            //             ),
-            //         ]);
-
-            //         if (!results?.length) {
-            //             session.retire();
-            //             if (totalCount > 0) {
-            //                 await Apify.setValue(`SEARCHSTATE-${Math.random()}`, queryStates);
-            //                 throw new Error(`No map results but result count is ${totalCount}`);
-            //             } else {
-            //                 log.debug('Really zero results');
-            //                 return;
-            //             }
-            //         }
-
-            //         for (const { qs } of queryStates) {
-            //             log.info(`Searching homes at ${JSON.stringify(qs.mapBounds)}`, {
-            //                 url: page.url(),
-            //             });
-
-            //             // Extract home data from mapResults
-            //             const thr = input.splitThreshold || 500;
-
-            //             if (results.length >= thr) {
-            //                 if (input.maxLevel && (request.userData.splitCount || 0) >= input.maxLevel) {
-            //                     log.info('Over max level');
-            //                 } else {
-            //                     // Split map and enqueue sub-rectangles
-            //                     const splitCount = (request.userData.splitCount || 0) + 1;
-            //                     const split = splitQueryState(qs);
-
-            //                     for (const searchQueryState of split) {
-            //                         if (isOverItems()) {
-            //                             break;
-            //                         }
-
-            //                         const uniqueKey = quickHash(`${request.url}${splitCount}${JSON.stringify(searchQueryState)}`);
-            //                         log.debug('queryState', { searchQueryState, uniqueKey });
-            //                         const url = new URL(request.url);
-
-            //                         url.searchParams.set('searchQueryState', JSON.stringify(searchQueryState));
-
-            //                         await requestQueue.addRequest({
-            //                             url: url.toString(),
-            //                             userData: {
-            //                                 searchQueryState,
-            //                                 label: LABELS.QUERY,
-            //                                 splitCount,
-            //                             },
-            //                             uniqueKey,
-            //                         });
-            //                     }
-            //                 }
-            //             }
-
-            //             if (results.length > 0) {
-            //                 const extracted = () => {
-            //                     log.info(`Extracted total ${zpids.size}`);
-            //                 };
-            //                 const interval = setInterval(extracted, 10000);
-
-            //                 try {
-            //                     for (const { zpid, detailUrl } of results) {
-            //                         await dump(zpid, results);
-
-            //                         if (zpid) {
-            //                             await processZpid(zpid, detailUrl);
-
-            //                             if (isOverItems()) {
-            //                                 break; // optimize runtime
-            //                             }
-            //                         }
-            //                     }
-            //                 } finally {
-            //                     if (!anyErrors) {
-            //                         extracted();
-            //                     }
-            //                     clearInterval(interval);
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
 
             await extendScraperFunction(undefined, {
                 page,
@@ -944,6 +967,7 @@ Apify.main(async () => {
         handleFailedRequestFunction: async ({ request, error }) => {
             // This function is called when the crawling of a request failed too many times
             log.exception(error, `\n\nRequest ${request.url} failed too many times.\n\n`);
+            await Apify.pushData({id: request.userData.eid, error: 'It was not possible to get a ZPID and their data for given address'});
         },
     });
 
